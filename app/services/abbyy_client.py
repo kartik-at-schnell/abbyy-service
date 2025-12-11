@@ -22,7 +22,7 @@ class ABBYYFatalError(ABBYYClientException):
     pass
 
 class ABBYYClient:
-    
+
     ENDPOINT = "/FlexiCapture12/Server/FCAuth/API/v1/Json"
     
     def __init__(
