@@ -54,7 +54,7 @@ class ABBYYPollingService:
         self.abbyy = ABBYYClient()
     
     def run_cycle(self):
-        """Run one polling cycle"""
+        doc = None 
         logger.info("=" * 60)
         logger.info("POLLING CYCLE STARTED")
         logger.info("=" * 60)

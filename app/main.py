@@ -79,8 +79,25 @@ router = APIRouter(prefix="/api/abbyy")
 router.include_router(admin.router)
 router.include_router(documents.router)
 
+@app.post("/test/poll-now")
+async def test_poll_now():
+    try:
+        db = SessionLocal()
+        polling_service = ABBYYPollingService(db)
+        polling_service.run_cycle()
+        db.close()
+        return {"status": "polling completed"}
+    except Exception as e:
+        return {"error": str(e)}
+    
+
 app.include_router(router)
+
+logger.info(f"Scheduler jobs: {scheduler.get_jobs()}")
+logger.info(f"Scheduler running: {scheduler.running}")
+
 
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
+    
