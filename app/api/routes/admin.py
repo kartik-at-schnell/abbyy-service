@@ -11,7 +11,7 @@ from app.services.abbyy_client import ABBYYClient
 from app.config import settings
 
 logger = logging.getLogger(__name__)
-router = APIRouter(prefix="/api/v1/admin", tags=["admin"])
+router = APIRouter(prefix="/admin", tags=["admin"])
 
 abbyy_client = ABBYYClient()
 

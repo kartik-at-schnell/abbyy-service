@@ -1,78 +1,85 @@
-# main.py
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from fastapi import FastAPI, APIRouter
+from apscheduler.schedulers.background import BackgroundScheduler
 import logging
 from contextlib import asynccontextmanager
+import pkgutil
+import importlib
+from pathlib import Path
+from typing import Optional
+
+from app.api.routes import admin
+from app.api.routes import documents
 
 from app.config import settings
 from app.database import init_db, SessionLocal
-from app.services.abbyy_client import ABBYYClient
 from app.services.polling_service import ABBYYPollingService
 
-# logging
+# Configure logging
 logging.basicConfig(
     level=settings.LOG_LEVEL,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
 
-
-scheduler = AsyncIOScheduler()
+# global scheduler
+scheduler = BackgroundScheduler()
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-
-    logger.info("Starting PRU Backend")
+    
+    # Startup
+    logger.info("Starting ABBYY OCR Microservice")
     init_db()
     
     db = SessionLocal()
-    abbyy_client = ABBYYClient()
-    polling_service = ABBYYPollingService(db, abbyy_client)
+    polling_service = ABBYYPollingService(db)
     
+    # Schedule polling job
     scheduler.add_job(
         polling_service.run_cycle,
-        'interval',
+        "interval",
         minutes=settings.POLLING_INTERVAL_MINUTES,
-        id='abbyy_polling'
+        id="abbyy_polling"
     )
     scheduler.start()
-    logger.info(f"polling every {settings.POLLING_INTERVAL_MINUTES} minutes")
+    logger.info(f"Polling scheduled every {settings.POLLING_INTERVAL_MINUTES} minutes")
     
     yield
     
-    logger.info("hutting down")
+    # Shutdown
+    logger.info("Shutting down")
     scheduler.shutdown()
     db.close()
 
+
+# Create app
 app = FastAPI(
     title=settings.API_TITLE,
     version=settings.API_VERSION,
     lifespan=lifespan
 )
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
-from app.api import documents, admin, health
-app.include_router(documents.router)
-app.include_router(admin.router)
-app.include_router(health.router)
+@app.get("/health")
+async def health():
+    return {"status": "healthy", "service": settings.API_TITLE}
 
 
 @app.get("/")
 async def root():
     return {
-        "app": settings.API_TITLE,
+        "service": settings.API_TITLE,
         "version": settings.API_VERSION,
         "status": "running"
     }
+
+router = APIRouter(prefix="/api/abbyy")
+
+router.include_router(admin.router)
+router.include_router(documents.router)
+
+app.include_router(router)
 
 if __name__ == "__main__":
     import uvicorn

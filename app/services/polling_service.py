@@ -1,235 +1,196 @@
 import logging
-import asyncio
 import base64
-from datetime import datetime, timedelta
-from typing import Optional
-from uuid import uuid4
-from sqlalchemy.orm import Session as DBSession
-
-from app.models import DocumentLibrary, DocumentProcessingLog
-from app.services.abbyy_client import ABBYYClient, ABBYYRetryableError, ABBYYFatalError
-from app.services.session_manager import SessionManager
-from app.services.error_handler import ErrorHandler, ErrorType
+import requests
+from datetime import datetime
+from sqlalchemy.orm import Session
+from app.models import DocumentLibrary
+from app.services.abbyy_client import ABBYYClient
 from app.config import settings
 
 logger = logging.getLogger(__name__)
 
-class ABBYYPollingService:    
-    def __init__(self, db: DBSession, abbyy_client: ABBYYClient):
-        self.db = db
-        self.abbyy_client = abbyy_client
-        self.session_manager = SessionManager(db, abbyy_client)
-        self.error_handler = ErrorHandler()
+
+class RecordTypeValidator:
+    """Validate record type and route to correct PRU endpoint"""
     
-    #main polling cycle
-    async def run_cycle(self):
-        cycle_id = str(uuid4())[:8]
-        cycle_start = datetime.utcnow()
+    VEHICLE_REGISTRATION = "VEHICLE_REGISTRATION"
+    DRIVING_LICENSE = "DRIVING_LICENSE"
+    RECORD_SUPPRESSION = "RECORD_SUPPRESSION"
+    
+    @staticmethod
+    def get_record_type(document_type: str):
+        """Get normalized record type"""
+        if not document_type:
+            return None
         
-        logger.info(f"[CYCLE {cycle_id}] Starting polling cycle")
+        doc_type = document_type.upper().strip()
+        
+        if "VEHICLE" in doc_type or "VR" in doc_type:
+            return RecordTypeValidator.VEHICLE_REGISTRATION
+        elif "DRIVING" in doc_type or "LICENSE" in doc_type or "DL" in doc_type:
+            return RecordTypeValidator.DRIVING_LICENSE
+        elif "SUPPRESSION" in doc_type or "RS" in doc_type:
+            return RecordTypeValidator.RECORD_SUPPRESSION
+        
+        return None
+    
+    @staticmethod
+    def get_pru_endpoint(record_type: str):
+        """Get PRU endpoint based on record type"""
+        if record_type == RecordTypeValidator.VEHICLE_REGISTRATION:
+            return settings.PRU_VEHICLE_ENDPOINT
+        elif record_type == RecordTypeValidator.DRIVING_LICENSE:
+            return settings.PRU_DRIVING_LICENSE_ENDPOINT
+        elif record_type == RecordTypeValidator.RECORD_SUPPRESSION:
+            return settings.PRU_RECORD_SUPPRESSION_ENDPOINT
+        
+        return None
+
+
+class ABBYYPollingService:
+    
+    def __init__(self, db: Session):
+        self.db = db
+        self.abbyy = ABBYYClient()
+    
+    def run_cycle(self):
+        """Run one polling cycle"""
+        logger.info("=" * 60)
+        logger.info("POLLING CYCLE STARTED")
+        logger.info("=" * 60)
         
         try:
-            session_id = await self.session_manager.get_or_create_session() #get session
-            submitted_count = await self._process_queued_documents(cycle_id, session_id)    #submit docs
-            completed_count = await self._check_processing_status(cycle_id, session_id) #check status
-            timeout_count = await self._handle_timeouts(cycle_id)   #get how many timeouts
-
-            await self.session_manager.cleanup_expired_sessions()
+            # Step 1: Get next queued document
+            doc = self.db.query(DocumentLibrary).filter(
+                DocumentLibrary.status == "QUEUED_FOR_ABBYY"
+            ).first()
             
-            elapsed = (datetime.utcnow() - cycle_start).total_seconds()
-            logger.info(
-                f"[CYCLE {cycle_id}] Completed: "
-                f"{submitted_count} submitted, {completed_count} completed, "
-                f"{timeout_count} timed out. Elapsed: {elapsed:.2f}s"
-            )
-        
-        except Exception as e:
-            logger.error(f"[CYCLE {cycle_id}] Unexpected error: {str(e)}", exc_info=True)
-    
-
-    async def _process_queued_documents(self, cycle_id: str, session_id: str) -> int:
-        
-        docs = self.db.query(DocumentLibrary).filter(
-            DocumentLibrary.status == "QUEUED_FOR_ABBYY"
-        ).limit(settings.BATCH_SUBMIT_PER_CYCLE).all()
-        
-        logger.info(f"[CYCLE {cycle_id}] Found {len(docs)} queued documents")
-        submitted = 0
-        
-        for doc in docs:
+            if not doc:
+                logger.info("✓ No documents to process")
+                logger.info("=" * 60)
+                return
+            
+            logger.info(f"Processing Document ID: {doc.id}")
+            logger.info(f"Document Type: {doc.document_type}")
+            
+            # Step 2: Validate record type
+            record_type = RecordTypeValidator.get_record_type(doc.document_type)
+            if not record_type:
+                logger.error(f"✗ Invalid document type: {doc.document_type}")
+                doc.status = "FAILED"
+                doc.error_message = f"Invalid record type: {doc.document_type}"
+                self.db.commit()
+                return
+            
+            logger.info(f"✓ Record type validated: {record_type}")
+            
+            # Step 3: Read file and encode to base64
             try:
-                logger.info(f"[DOC {doc.id}] Submitting to ABBYY")
-                
-                #create batch
-                batch_id = await self.abbyy_client.add_batch(
-                    session_id=session_id,
-                    project_id=settings.ABBYY_PROJECT_ID,
-                    batch_name=f"Batch_Doc{doc.id}_{datetime.utcnow().timestamp()}"
-                )
-                
-                # open batch
-                await self.abbyy_client.open_batch(session_id, batch_id)
-                
-                #encode file
-                try:
-                    with open(doc.document_url, 'rb') as f:
-                        file_content = f.read()
-                    file_base64 = base64.b64encode(file_content).decode('utf-8')
-                except Exception as e:
-                    raise ABBYYFatalError(f"Cannot read file: {str(e)}")
-                
-                #add document
-                await self.abbyy_client.add_document(
-                    session_id=session_id,
-                    batch_id=batch_id,
-                    file_content_base64=file_base64,
-                    document_name=doc.document_name
-                )
-
-                await self.abbyy_client.close_batch(session_id, batch_id)
-
-                await self.abbyy_client.process_batch(session_id, batch_id)
-
-                doc.status = "SENT_TO_ABBYY"
-                doc.abbyy_batch_id = batch_id
-                doc.abbyy_submitted_at = datetime.utcnow()
+                with open(doc.file_path, "rb") as f:
+                    file_bytes = f.read()
+                file_base64 = base64.b64encode(file_bytes).decode("utf-8")
+                logger.info(f"✓ File read and encoded: {len(file_bytes)} bytes")
+            except FileNotFoundError:
+                logger.error(f"✗ File not found: {doc.file_path}")
+                doc.status = "FAILED"
+                doc.error_message = f"File not found: {doc.file_path}"
                 self.db.commit()
-                
-                self._log_event(doc.id, "BATCH_SUBMITTED", "QUEUED_FOR_ABBYY", "SENT_TO_ABBYY")
-                submitted += 1
-                logger.info(f"[DOC {doc.id}] Submitted (batch={batch_id})")
+                return
             
-            except (ABBYYRetryableError, asyncio.TimeoutError) as e:
-                logger.warning(f"[DOC {doc.id}] Retryable error: {str(e)}")
-                self._handle_retry(doc, "QUEUED_FOR_ABBYY", str(e))
+            # Step 4: Open ABBYY session
+            session_id = self.abbyy.open_session()
             
-            except ABBYYFatalError as e:
-                logger.error(f"[DOC {doc.id}] Fatal error: {str(e)}")
-                doc.status = "HOLDING_ZONE"
-                doc.abbyy_error_message = str(e)
-                self.db.commit()
-                self._log_event(doc.id, "ERROR_FATAL", "QUEUED_FOR_ABBYY", "HOLDING_ZONE")
+            # Step 5: Create batch
+            batch_name = f"Doc-{doc.id}-{datetime.utcnow().timestamp()}"
+            batch_id = self.abbyy.add_batch(session_id, batch_name)
             
-            except Exception as e:
-                logger.error(f"[DOC {doc.id}] Unexpected error: {str(e)}", exc_info=True)
-                doc.status = "HOLDING_ZONE"
-                doc.abbyy_error_message = str(e)
-                self.db.commit()
-        
-        return submitted
-    
-    #check status
-    async def _check_processing_status(self, cycle_id: str, session_id: str) -> int:        
-        docs = self.db.query(DocumentLibrary).filter(
-            DocumentLibrary.status.in_(["SENT_TO_ABBYY", "PROCESSING_BY_ABBYY"])
-        ).limit(settings.BATCH_CHECK_PER_CYCLE).all()
-        
-        logger.info(f"[CYCLE {cycle_id}] Checking {len(docs)} processing documents")
-        completed = 0
-        
-        for doc in docs:
-            try:
-                batch_status = await self.abbyy_client.get_batch_status(doc.abbyy_batch_id)
+            # Step 6: Open batch
+            self.abbyy.open_batch(session_id, batch_id)
+            
+            # Step 7: Add document
+            doc_name = doc.file_path.split("/")[-1]
+            self.abbyy.add_document(session_id, batch_id, file_base64, doc_name)
+            
+            # Step 8: Close batch
+            self.abbyy.close_batch(session_id, batch_id)
+            
+            # Step 9: Process batch
+            self.abbyy.process_batch(session_id, batch_id)
+            
+            # Step 10: Check status (wait for completion)
+            logger.info("Waiting for ABBYY processing...")
+            max_wait = 30  # 30 cycles * 10 seconds = 5 minutes max
+            for attempt in range(max_wait):
+                status_result = self.abbyy.get_batch_status(batch_id)
                 
-                logger.debug(
-                    f"[DOC {doc.id}] Status: {batch_status['status']}, "
-                    f"Progress: {batch_status['progress']}%"
-                )
-                
-                if batch_status['status'] == 'Done':
-                    results_json = batch_status.get('extracted_data', {})
-                    doc.ocr_response_json = results_json
-                    doc.ocr_confidence_score = self._extract_confidence(results_json)
-                    doc.abbyy_completed_at = datetime.utcnow()
-                    doc.status = "COMPLETED"
-                    self.db.commit()
+                if status_result["status"] == "completed":
+                    logger.info("✓ Processing completed!")
+                    extracted_data = status_result["extracted_data"]
                     
-                    logger.info(f"[DOC {doc.id}] Completed (confidence={doc.ocr_confidence_score:.1f}%)")
-                    self._log_event(doc.id, "RESULT_RECEIVED", "SENT_TO_ABBYY", "COMPLETED")
-                    completed += 1
-                
-                elif batch_status['status'] == 'Error':
-                    doc.status = "HOLDING_ZONE"
-                    doc.abbyy_error_message = batch_status.get('error_message', 'Unknown error')
-                    self.db.commit()
+                    # Step 11: Send to PRU
+                    pru_endpoint = RecordTypeValidator.get_pru_endpoint(record_type)
+                    logger.info(f"Sending results to PRU: {pru_endpoint}")
                     
-                    logger.error(f"[DOC {doc.id}] ABBYY error: {doc.abbyy_error_message}")
-                    self._log_event(doc.id, "ERROR_FROM_ABBYY", "SENT_TO_ABBYY", "HOLDING_ZONE")
+                    try:
+                        response = requests.post(
+                            pru_endpoint,
+                            json={
+                                "document_id": doc.id,
+                                "record_type": record_type,
+                                "extracted_data": extracted_data,
+                                "timestamp": datetime.utcnow().isoformat()
+                            },
+                            timeout=30
+                        )
+                        
+                        if response.status_code == 200:
+                            logger.info("✓ Results sent to PRU successfully")
+                            doc.status = "COMPLETED"
+                            doc.extracted_data = extracted_data
+                        else:
+                            logger.error(f"✗ PRU returned status {response.status_code}")
+                            doc.status = "FAILED"
+                            doc.error_message = f"PRU error: {response.status_code}"
+                    
+                    except requests.exceptions.RequestException as e:
+                        logger.error(f"✗ Failed to reach PRU: {str(e)}")
+                        doc.status = "FAILED"
+                        doc.error_message = f"PRU connection error: {str(e)}"
+                    
+                    break
+                
+                elif status_result["status"] == "error":
+                    logger.error(f"✗ ABBYY error: {status_result['error_message']}")
+                    doc.status = "FAILED"
+                    doc.error_message = status_result["error_message"]
+                    break
                 
                 else:
-                    doc.status = "PROCESSING_BY_ABBYY"
-                    self.db.commit()
+                    logger.debug(f"Processing... {status_result['progress']}%")
+                    import time
+                    time.sleep(10)
             
-            except Exception as e:
-                logger.error(f"[DOC {doc.id}] Error checking status: {str(e)}", exc_info=True)
-        
-        return completed
-    
-    # handle docs stuck in processing for long time
-    async def _handle_timeouts(self, cycle_id: str) -> int:        
-        timeout_threshold = datetime.utcnow() - timedelta(minutes=settings.TIMEOUT_MINUTES)
-        
-        docs = self.db.query(DocumentLibrary).filter(
-            DocumentLibrary.status == "SENT_TO_ABBYY",
-            DocumentLibrary.abbyy_submitted_at < timeout_threshold
-        ).all()
-        
-        logger.info(f"[CYCLE {cycle_id}] Found {len(docs)} timed out documents")
-        
-        for doc in docs:
-            doc.status = "HOLDING_ZONE"
-            doc.abbyy_error_message = f"Processing timeout (>{settings.TIMEOUT_MINUTES}min)"
+            else:
+                logger.error("✗ Processing timeout")
+                doc.status = "FAILED"
+                doc.error_message = "ABBYY processing timeout"
+            
+            # Step 12: Close session
+            self.abbyy.close_session(session_id)
+            
+            # Update database
+            doc.processed_at = datetime.utcnow()
             self.db.commit()
-            self._log_event(doc.id, "TIMEOUT", "SENT_TO_ABBYY", "HOLDING_ZONE")
+            
+            logger.info("=" * 60)
+            logger.info(f"CYCLE COMPLETE - Status: {doc.status}")
+            logger.info("=" * 60)
         
-        return len(docs)
-    
-    def _extract_confidence(self, results_json: dict) -> float:
-        if not results_json or 'pages' not in results_json:
-            return 0.0
-        
-        confidences = []
-        for page in results_json.get('pages', []):
-            for field in page.get('fields', []):
-                if 'confidence' in field:
-                    confidences.append(field['confidence'])
-        
-        return sum(confidences) / len(confidences) if confidences else 0.0
-    
-    #handle errs that can be retried
-    def _handle_retry(self, doc: DocumentLibrary, current_status: str, error: str):
-        
-        log_entry = self.db.query(DocumentProcessingLog).filter_by(
-            document_id=doc.id
-        ).order_by(DocumentProcessingLog.timestamp.desc()).first()
-        
-        retry_count = (log_entry.retry_count + 1) if log_entry else 1
-        
-        if retry_count >= settings.MAX_RETRIES:
-            doc.status = "HOLDING_ZONE"
-            doc.abbyy_error_message = f"Max retries exceeded ({settings.MAX_RETRIES})"
-            self.db.commit()
-            self._log_event(
-                doc.id, "MAX_RETRIES_EXCEEDED", current_status, "HOLDING_ZONE"
-            )
-        else:
-            self._log_event(doc.id, "RETRY", current_status, current_status)
-
-    # log the event
-    def _log_event(
-        self,
-        doc_id: int,
-        event: str,
-        status_before: str,
-        status_after: str
-    ):        
-        log = DocumentProcessingLog(
-            document_id=doc_id,
-            event=event,
-            status_before=status_before,
-            status_after=status_after,
-            timestamp=datetime.utcnow(),
-            performed_by='system'
-        )
-        self.db.add(log)
-        self.db.commit()
+        except Exception as e:
+            logger.error(f"✗ Unexpected error: {str(e)}", exc_info=True)
+            if doc:
+                doc.status = "FAILED"
+                doc.error_message = str(e)
+                self.db.commit()
+            
+            logger.info("=" * 60)

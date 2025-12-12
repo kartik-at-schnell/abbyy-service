@@ -1,4 +1,4 @@
-from sqlalchemy import Column, String, Float, Boolean, DateTime
+from sqlalchemy import Column, String, Float, Boolean, DateTime, UniqueConstraint
 from datetime import datetime
 from app.models.base import BaseModel
 #ocr field extraction
@@ -12,11 +12,12 @@ class FieldMapping(BaseModel):
     required = Column(Boolean, default=False, nullable=False)
     
     __table_args__ = (
-        {'uniqueconstraints': [('document_type', 'abbyy_field_name')]},
+        UniqueConstraint("document_type", "abbyy_field_name", name="uq_document_field_pair"),
     )
     
     def __repr__(self):
         return f"<FieldMapping({self.document_type}.{self.abbyy_field_name})>"
+
 
 DEFAULT_FIELD_MAPPINGS = [
     {
