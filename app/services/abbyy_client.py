@@ -7,14 +7,23 @@ logger = logging.getLogger(__name__)
 
 
 class ABBYYClient:
-    """Simple ABBYY API client - follows Postman collection"""
     
-    def __init__(self):
-        self.base_url = settings.ABBYY_API_URL
-        self.username = settings.ABBYY_USERNAME
-        self.password = settings.ABBYY_PASSWORD
-        self.project_id = settings.ABBYY_PROJECT_ID
-        self.tenant = settings.ABBYY_TENANT
+    ENDPOINT = "/FlexiCapture12/Server/FCAuth/API/v1/Json"
+    
+    def __init__(
+        self,
+        server_url: str = None,
+        username: str = None,
+        password: str = None,
+        tenant: str = None
+    ):
+        self.server_url = server_url or settings.ABBYY_SERVER_URL
+        self.username = username or settings.ABBYY_USERNAME
+        self.password = password or settings.ABBYY_PASSWORD
+        self.tenant = tenant or settings.ABBYY_TENANT
+        self.http_client = None
+        
+        logger.info(f"ABBYYClient initialized (server={self.server_url})")
     
     def _get_auth_header(self):
         """Get Basic Auth header"""
